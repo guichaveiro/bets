@@ -33,7 +33,7 @@ import numpy as np
 import polars as pl
 import polars.selectors as cs
 import statsmodels.api as sm
-from scipy import special, stats
+from scipy import optimize, special, stats
 
 warnings.filterwarnings("ignore")
 
@@ -49,12 +49,16 @@ RAAS_CNES = DATA / "caps/processed/sia_raas_cnes.parquet"
 FTP = "ftp://ftp.datasus.gov.br/dissemin/publicos/SIASUS/200801_/Dados"
 
 INICIO, FIM_APS, FIM_CAPS = "201801", "202609", "202606"  # RAAS chegam com atraso: jul–ago/2026 incompletos
+# APS começa em fev/2018: jan/2018, 1º mês do SISAB, tem 34 registros de F63.0 contra 5–18 nos 11 meses seguintes
+# (taxa 3× a maior do resto de 2018) e sozinho cria uma quebra espúria. A série completa entra na robustez.
+INICIO_APS = "201802"
 PANDEMIA = ("202003", "202112")
 KMAX, MIN_SEG, LAGS, BLOCO = 2, 12, 6, 6  # máx. de quebras; meses mínimos por segmento; defasagens HAC; bloco boot
 
 # Grupos (CID-10 principal)
 REF_CID = ["F32", "F33", "F41", "F43", "F10", "F20"]  # referência: depressão, ansiedade, estresse, álcool, esquizofrenia
 CONTROLE_CID = ["F631", "F632", "F633"]  # controle negativo: piromania, cleptomania, tricotilomania
+INESPEC_CID = ["F63", "F638", "F639"]  # F63 sem especificação: podem conter jogo (só no CAPS; o SISAB não foi consultado)
 REF_SISAB = ["depressao_cid", "depressao_rec_cid", "ansiedade_cid", "estresse_cid", "alcool_cid", "esquizofrenia_cid"]
 CONTROLE_SISAB = ["piromania_cid", "cleptomania_cid", "tricotilomania_cid"]
 CIAP_SISAB = ["depressao_ciap", "ansiedade_ciap", "sensacao_ansiedade_ciap", "tristeza_ciap", "alcool_ciap",
@@ -108,7 +112,8 @@ def pct(x):
 
 
 # %% 1. Dados ------------------------------------------------------------------------------------------------------
-# 1a. CAPS: contagem de registros de RAAS a partir dos .dbc do SIA-PS. O .dbf tem registros de largura fixa e só os
+# 1a. CAPS: contagem de linhas de RAAS (cada linha = um procedimento registrado, datado por DT_ATEND) a partir dos
+# .dbc do SIA-PS. O .dbf tem registros de largura fixa e só os
 # bytes das colunas abaixo são lidos: CNS_PAC (cartão SUS) e DTNASC nunca saem do arquivo.
 COLS = ["CNES_EXEC", "DT_ATEND", "SEXOPAC", "CIDPRI", "DT_INICIO"]
 
@@ -222,6 +227,7 @@ def serie_caps() -> pl.DataFrame:
     jogo, ref = cid == "F630", cid.is_in(REF_CID)
     t = d.group_by("cmp").agg(
         jogo=r.filter(jogo).sum(), controle=r.filter(cid.is_in(CONTROLE_CID)).sum(), trico=r.filter(cid == "F633").sum(),
+        inespec=r.filter(cid.is_in(INESPEC_CID)).sum(),
         referencia=r.filter(ref).sum(), mental=r.filter(cid != "outro").sum(), total=r.sum(),
         jogo_inicio=r.filter(jogo & ini).sum(), referencia_inicio=r.filter(ref & ini).sum(),
         jogo_F=r.filter(jogo & (sx == "F")).sum(), jogo_M=r.filter(jogo & (sx == "M")).sum(),
@@ -307,6 +313,12 @@ def _irls(X, y, off, fam, n=None, alpha=0.0, it=100, tol=1e-8):
     return beta, mu
 
 
+def _loglik_nb(y, mu, alpha):
+    r = 1 / alpha
+    return np.sum(special.gammaln(y + r) - special.gammaln(r) - special.gammaln(y + 1)
+                  + r * np.log(r / (r + mu)) + y * np.log(mu / (r + mu)))
+
+
 def buscar(y, X0, t, k, fam, off, n, alpha):
     """Posições das k quebras que minimizam o desvio (busca exaustiva; ≥ MIN_SEG meses entre quebras e pontas)."""
     if k == 0:
@@ -369,13 +381,16 @@ def ajustar(y, meses, taus, fam, off=None, n=None, lags=LAGS, pandemia=True) -> 
     nomes = nomes + [f"delta{j + 1}" for j in range(len(taus))]
     hac = dict(cov_type="HAC", cov_kwds={"maxlags": lags})
     if fam == "nb":
-        b0, _ = _irls(X, y, off, "nb", alpha=0.05)
-        r = sm.NegativeBinomial(y, X, offset=off).fit(start_params=np.r_[b0, 0.05], disp=0, maxiter=500, **hac)
-        beta, alpha = r.params[:-1], r.params[-1]
-        mu = np.exp(off + X @ beta)
+        # como o glm.nb do R: alpha por máxima verossimilhança perfilada, β por GLM com alpha fixo
+        alpha = float(np.exp(optimize.minimize_scalar(
+            lambda la: -_loglik_nb(y, _irls(X, y, off, "nb", alpha=np.exp(la))[1], np.exp(la)),
+            bounds=(np.log(1e-6), np.log(10)), method="bounded", options={"xatol": 1e-5}).x))
+        r = sm.GLM(y, X, family=sm.families.NegativeBinomial(alpha=alpha), offset=off).fit(**hac)
+        if not r.converged:
+            print(f"  ! binomial negativa não convergiu (quebras {taus})")
+        beta, mu, cov = r.params, r.mu, r.cov_params()
         dev = _desvio(y, mu, "nb", alpha=alpha)
-        crit, phi = -2 * r.llf + (X.shape[1] + 1 + len(taus)) * np.log(len(y)), 1.0  # + alpha + posições
-        cov = r.cov_params()[:-1, :-1]
+        crit, phi = -2 * _loglik_nb(y, mu, alpha) + (X.shape[1] + 1 + len(taus)) * np.log(len(y)), 1.0  # + alpha + posições
     else:
         r = sm.GLM(np.column_stack([y, n - y]), X, family=sm.families.Binomial()).fit(**hac)
         beta, mu, alpha = r.params, n * r.mu, 0.0
@@ -409,27 +424,37 @@ def selecionar(y, meses, fam, off=None, n=None, kmax=KMAX, k_fixo=None, pandemia
     return min((a for a in todos.values() if a.crit <= cmin + 2), key=lambda a: a.k), todos
 
 
-def bootstrap(aj: Ajuste, B: int, processos: int, seed=1):
-    """Bootstrap por blocos móveis (6 meses) dos resíduos de Pearson; refaz a busca das quebras em cada réplica."""
-    partes = [(aj, len(p), seed * 1000 + i) for i, p in enumerate(np.array_split(np.arange(B), processos)) if len(p)]
+def sorteio_blocos(B: int, seed=1):
+    """Um único sorteio de blocos de 6 meses de calendário, usado por todas as séries: a réplica b da APS e a do
+    CAPS reamostram os mesmos meses (bootstrap conjunto; preserva choques comuns às duas redes).
+    Linha b: para cada mês de calendário desde jan/2018, o mês cujo resíduo entra no lugar dele."""
+    total = int(tempo([INICIO, FIM_APS])[1]) + 1
+    lo = int(tempo([INICIO, INICIO_APS])[1])  # só blocos que existem nas duas séries
+    hi = int(tempo([INICIO, FIM_CAPS])[1]) - BLOCO + 1
+    ini = np.random.default_rng(seed).integers(lo, hi + 1, (B, int(np.ceil(total / BLOCO))))
+    return (ini[:, :, None] + np.arange(BLOCO)).reshape(B, -1)[:, :total]
+
+
+def bootstrap(aj: Ajuste, mapa: np.ndarray, processos: int):
+    """Bootstrap por blocos móveis dos resíduos de Pearson (K fixo); refaz a busca das quebras em cada réplica."""
+    partes = [(aj, mapa[p]) for p in np.array_split(np.arange(len(mapa)), processos) if len(p)]
     with ProcessPoolExecutor(len(partes), mp_context=get_context("fork")) as ex:
         res = list(ex.map(_boot, partes))
     aj.boot = {"taus": np.vstack([r[0] for r in res]), "incl": np.vstack([r[1] for r in res])}
 
 
 def _boot(args):
-    aj, B, seed = args
-    rng = np.random.default_rng(seed)
-    nt = len(aj.y)
+    aj, mapa = args
+    B = len(mapa)
     sd = np.sqrt(aj.mu + aj.alpha * aj.mu ** 2) if aj.fam == "nb" else np.sqrt(aj.mu * (1 - aj.mu / aj.n))
     r = (aj.y - aj.mu) / sd
     r -= r.mean()
     X0, _, t = base(aj.meses, aj.pandemia)
+    c0 = int(tempo([INICIO, aj.meses[0]])[1])
+    cal = c0 + t.astype(int)  # mês de calendário de cada observação
     taus_b, incl_b = [], []
-    for _ in range(B):
-        ini = rng.integers(0, nt - BLOCO + 1, int(np.ceil(nt / BLOCO)))
-        ys = np.clip(np.round(aj.mu + sd * np.concatenate([r[i:i + BLOCO] for i in ini])[:nt]), 0,
-                     None if aj.fam == "nb" else aj.n)
+    for linha in mapa:
+        ys = np.clip(np.round(aj.mu + sd * r[linha[cal] - c0]), 0, None if aj.fam == "nb" else aj.n)
         taus = buscar(ys, X0, t, aj.k, aj.fam, aj.off, aj.n, aj.alpha)
         beta, _ = _irls(np.column_stack([X0, hinges(t, taus)]), ys, aj.off, aj.fam, aj.n, aj.alpha)
         taus_b.append(taus)
@@ -496,7 +521,7 @@ def relatar(rotulo, aj: Ajuste, todos=None):
         if aj.boot:
             a, b = ic_quebra(aj, j)
             linha += f" (IC95% bootstrap {fmt_mes(a)}–{fmt_mes(b)})"
-        out(linha + f"; mudança de inclinação z = {dec(d / np.sqrt(v))}, p = {fmt_p(2 * stats.norm.sf(abs(d / np.sqrt(v))))}")
+        out(linha + f"; mudança de inclinação z = {dec(d / np.sqrt(v))}")
     r = vpam(aj)
     linha = f"  VPAM {fmt_mes(aj.meses[0])}–{fmt_mes(aj.meses[-1])}: {pct(r[0])} (IC95% HAC {pct(r[1])}; {pct(r[2])})"
     out(linha + (f" [bootstrap {pct(r[4])}; {pct(r[5])}]" if aj.boot else ""))
@@ -519,7 +544,8 @@ def main():
     if x.refazer_caps or not RAAS.exists():
         refazer_caps(x.processos)
 
-    a, c = serie_aps(), serie_caps()
+    a_completa, c = serie_aps(), serie_caps()
+    a = a_completa.filter(pl.col("cmp") >= INICIO_APS)
     S = {"aps": a, "caps": c}
     v = lambda df, col: df[col].to_numpy().astype(float)  # noqa: E731
     M = {}
@@ -530,13 +556,13 @@ def main():
         M[f"{f}_jogo_controle"] = (meses, dict(y=v(df, "jogo"), fam="bin", n=v(df, "jogo") + v(df, "controle")))
 
     out(f"Jogo patológico (F63.0) na APS e nos CAPS, Brasil — gerado por artigo/analise.py em {date.today():%d/%m/%Y}")
-    out(f"APS: SISAB, {fmt_mes(INICIO)}–{fmt_mes(FIM_APS)} ({a.height} meses). "
+    out(f"APS: SISAB, {fmt_mes(INICIO_APS)}–{fmt_mes(FIM_APS)} ({a.height} meses). "
         f"CAPS: RAAS/SIA-PS, {fmt_mes(INICIO)}–{fmt_mes(FIM_CAPS)} ({c.height} meses). Bootstrap: {x.B} réplicas.")
 
     # ---------------------------------------------------------------- 3. Descritiva
     secao("3. DESCRITIVA (registros por ano)")
     pop = populacao()
-    for f, df in S.items():
+    for f, df in (("aps", a_completa), ("caps", c)):
         cols = ["jogo", "controle", "referencia", "jogo_F", "jogo_M"]
         an = (df.with_columns(ano=pl.col("cmp").str.slice(0, 4).cast(pl.Int32)).group_by("ano")
               .agg(*[pl.col(k).sum() for k in cols], meses=pl.len()).join(pop, on="ano").sort("ano"))
@@ -561,11 +587,15 @@ def main():
 
     out("\n4b. Modelo principal: F63.0 com offset log(referência) — tendência da taxa de F63.0 por registro de "
         "referência, já descontado o crescimento do sistema")
+    out("IC bootstrap = IC principal (inclui a incerteza sobre a posição das quebras; K fixo nas réplicas). IC HAC e z "
+        "da mudança de inclinação são condicionais às quebras estimadas: não testam se a quebra existe (isso é feito "
+        "pelo BIC).")
+    mapa = sorteio_blocos(x.B)
     A, TODOS = {}, {}
     for nome in ("aps_jogo_ref", "caps_jogo_ref"):
         meses, kw = M[nome]
         A[nome], TODOS[nome] = selecionar(meses=meses, **kw)
-        bootstrap(A[nome], x.B, x.processos)
+        bootstrap(A[nome], mapa, x.processos)
         relatar(ROTULO[nome], A[nome], TODOS[nome])
 
     # ---------------------------------------------------------------- 5. Especificidade
@@ -575,16 +605,20 @@ def main():
         meses, kw = M[nome]
         A[nome], TODOS[nome] = selecionar(meses=meses, **kw)
         relatar(ROTULO[nome], A[nome], TODOS[nome])
+    out("\nCódigos F63 sem especificação (F63, F63.8, F63.9; só CAPS). Não são controle: podem conter casos de jogo. "
+        "Se crescem junto, parte da alta de F63.0 pode ser só codificação mais específica (F63 → F63.0).")
+    relatar("CAPS · F63, F63.8, F63.9 / referência",
+            selecionar(v(c, "inespec"), c["cmp"].to_list(), "nb", off=np.log(v(c, "referencia")))[0])
     out("\n5b. Jogo contra controle: binomial F63.0/(F63.0 + F63.1–3). A inclinação é a diferença entre as taxas de "
         "crescimento do jogo e do controle (VPA = crescimento anual da razão F63.0 : controle)")
     for nome in ("aps_jogo_controle", "caps_jogo_controle"):
         meses, kw = M[nome]
         A[nome], TODOS[nome] = selecionar(meses=meses, **kw)
-        bootstrap(A[nome], x.B, x.processos)
+        bootstrap(A[nome], mapa, x.processos)
         relatar(ROTULO[nome], A[nome], TODOS[nome])
 
     # ---------------------------------------------------------------- 6. Robustez
-    secao("6. ROBUSTEZ — VPA DO SEGMENTO FINAL EM CADA CENÁRIO (IC95% HAC)")
+    secao("6. ROBUSTEZ — VPA DO SEGMENTO FINAL EM CADA CENÁRIO (IC95% HAC, condicional às quebras)")
     sens = []
 
     def registrar(nome, cenario, aj):
@@ -607,6 +641,12 @@ def main():
             kw2 = {k: (val[keep] if isinstance(val, np.ndarray) else val) for k, val in kw.items()}
             registrar(nome, cen, selecionar(meses=[m for m, k in zip(meses, keep) if k], pandemia=pand, **kw2)[0])
         registrar(nome, "HAC com 12 defasagens", ajustar(aj.y, meses, aj.taus, aj.fam, aj.off, aj.n, lags=12))
+        if nome.startswith("aps"):
+            mc = a_completa["cmp"].to_list()
+            yc = v(a_completa, "jogo")
+            kwc = (dict(fam="nb", off=np.log(v(a_completa, "referencia"))) if nome.endswith("_ref")
+                   else dict(fam="bin", n=yc + v(a_completa, "controle")))
+            registrar(nome, "série completa (com jan/2018)", selecionar(yc, mc, **kwc)[0])
         if nome == "aps_jogo_ref":
             registrar(nome, "referência ampliada (CID + CIAP)",
                       selecionar(meses=meses, y=kw["y"], fam="nb", off=np.log(v(df, "ref_ampla")))[0])
@@ -615,36 +655,45 @@ def main():
                       selecionar(meses=meses, y=kw["y"], fam="nb", off=np.log(v(df, "mental")))[0])
             registrar(nome, "no máx. 10 registros por CAPS-mês",
                       selecionar(meses=meses, y=v(df, "jogo_cap10"), fam="nb", off=kw["off"])[0])
-            registrar(nome, "só RAAS abertas no mês (casos novos)",
+            registrar(nome, "desfecho = F63.0 + F63, F63.8, F63.9",
+                      selecionar(meses=meses, y=kw["y"] + v(df, "inespec"), fam="nb", off=kw["off"])[0])
+            registrar(nome, "só RAAS iniciadas no mês",
                       selecionar(meses=meses, y=v(df, "jogo_inicio"), fam="nb", off=np.log(v(df, "referencia_inicio")))[0])
         if nome.endswith("_controle"):
             registrar(nome, "controle = só F63.3",
                       selecionar(meses=meses, y=kw["y"], fam="bin", n=kw["y"] + v(df, "trico"))[0])
+        if nome == "caps_jogo_controle":
+            registrar(nome, "comparador = F63, F63.8, F63.9",
+                      selecionar(meses=meses, y=kw["y"], fam="bin", n=kw["y"] + v(df, "inespec"))[0])
+            registrar(nome, "no máx. 10 registros por CAPS-mês",
+                      selecionar(meses=meses, y=v(df, "jogo_cap10"), fam="bin", n=v(df, "jogo_cap10") + v(df, "controle"))[0])
     sens = pl.DataFrame(sens)
     tabela(sens.with_columns(pl.col("modelo").replace(ROTULO),
                              pl.col("quebra_final").map_elements(lambda m: fmt_mes(m) if m else "—", return_dtype=pl.String),
                              pl.col("vpa", "li", "ls").round(0).cast(pl.Int64)))
 
     # ---------------------------------------------------------------- 7. Objetivo secundário: onde começou
-    secao("7. SECUNDÁRIO — A ALTA COMEÇOU NA APS ANTES DO CAPS? (início do segmento final; bootstrap)")
-    for par, rot in (("jogo_ref", "F63.0 / referência"), ("jogo_controle", "F63.0 vs controle")):
+    secao("7. SECUNDÁRIO — A ALTA COMEÇOU NA APS ANTES DO CAPS? (início do segmento final; bootstrap conjunto)")
+    out("Réplicas pareadas: a réplica b da APS e a do CAPS reamostram os mesmos meses de calendário.")
+    for par, rot in (("jogo_ref", "F63.0 / referência (modelo principal)"),
+                     ("jogo_controle", "F63.0 vs controle (sensibilidade)")):
         qa, qc = A[f"aps_{par}"], A[f"caps_{par}"]
-        desl = tempo([qa.meses[0], qc.meses[0]])[1]  # as duas séries começam em jan/2018: desl = 0
-        da, dc = qa.boot["taus"][:, -1], qc.boot["taus"][:, -1] + desl
-        dif = dc - da[np.random.default_rng(11).permutation(len(da))]  # réplicas independentes
+        desl = tempo([qa.meses[0], qc.meses[0]])[1]  # posição do início do CAPS na escala de tempo da APS
+        dif = (qc.boot["taus"][:, -1] + desl) - qa.boot["taus"][:, -1]
         est = qc.taus[-1] + desl - qa.taus[-1]
         out(f"\n{rot}")
         out(f"  APS:  {fmt_mes(mes_mais(qa.meses[0], qa.taus[-1]))} (IC95% {' – '.join(map(fmt_mes, ic_quebra(qa)))})")
         out(f"  CAPS: {fmt_mes(mes_mais(qc.meses[0], qc.taus[-1]))} (IC95% {' – '.join(map(fmt_mes, ic_quebra(qc)))})")
         out(f"  defasagem CAPS − APS: {dec(est, 0)} meses (IC95% bootstrap {dec(np.percentile(dif, 2.5), 0)} a "
-            f"{dec(np.percentile(dif, 97.5), 0)}); CAPS depois da APS em {100 * np.mean(dif > 0):.0f}% das réplicas")
+            f"{dec(np.percentile(dif, 97.5), 0)}); CAPS depois da APS em {np.sum(dif > 0)}/{len(dif)} réplicas")
 
     # ---------------------------------------------------------------- 8. Objetivo secundário: feminização
-    secao("8. SECUNDÁRIO — FEMINIZAÇÃO: A PROPORÇÃO DE MULHERES CRESCE MAIS NO JOGO DO QUE NA REFERÊNCIA? (2022–2026)")
+    secao("8. SECUNDÁRIO (EXPLORATÓRIO) — FEMINIZAÇÃO: A PROPORÇÃO DE MULHERES CRESCE MAIS NO JOGO DO QUE NA REFERÊNCIA?")
     out("Logística empilhada (mulheres/total; séries jogo e referência), dummies de mês, tendência própria de cada "
-        "grupo; EP de Driscoll-Kraay (escores somados por mês, Newey-West com 6 defasagens).")
-    for f, df in S.items():
-        d = df.filter(pl.col("cmp") >= "202201")
+        "grupo; EP de Driscoll-Kraay (escores somados por mês, Newey-West com 6 defasagens). Janela 2022–2026 escolhida "
+        "depois de ver os dados (é quando o volume de F63.0 deixa de ser pequeno); por isso mostramos outras janelas.")
+
+    def feminizacao(d):
         X0, _, t = base(d["cmp"].to_list(), pandemia=False)
         nt, g = d.height, np.r_[np.zeros(d.height), np.ones(d.height)]
         ta = np.r_[t, t] / 12  # anos
@@ -653,13 +702,24 @@ def main():
         n = y + np.r_[v(d, "referencia_M"), v(d, "jogo_M")]
         r = sm.GLM(np.column_stack([y, n - y]), X, family=sm.families.Binomial()).fit(
             cov_type="hac-groupsum", cov_kwds={"time": np.r_[np.arange(nt), np.arange(nt)], "maxlags": LAGS})
-        b, V = r.params, r.cov_params()
-        out(f"\n{f.upper()}")
+        return r.params, r.cov_params()
+
+    def linha_or(rot, b, V, cv):
+        e, se = b[cv].sum(), np.sqrt(V[np.ix_(cv, cv)].sum())
+        out(f"  {rot:<38} {dec(np.exp(e), 2)} (IC95% {dec(np.exp(e - 1.96 * se), 2)}–{dec(np.exp(e + 1.96 * se), 2)}); "
+            f"p = {fmt_p(2 * stats.norm.sf(abs(e / se)))}")
+
+    for f, df in S.items():
+        d = df.filter(pl.col("cmp") >= "202201")
+        b, V = feminizacao(d)
+        out(f"\n{f.upper()} (2022–2026)")
         for rot, cv in (("OR por ano, referência", [-3]), ("OR por ano, jogo", [-3, -1]),
                         ("razão de OR jogo/referência (teste)", [-1])):
-            e, se = b[cv].sum(), np.sqrt(V[np.ix_(cv, cv)].sum())
-            out(f"  {rot:<38} {dec(np.exp(e), 2)} (IC95% {dec(np.exp(e - 1.96 * se), 2)}–{dec(np.exp(e + 1.96 * se), 2)}); "
-                f"p = {fmt_p(2 * stats.norm.sf(abs(e / se)))}")
+            linha_or(rot, b, V, cv)
+        out("  outras janelas (razão de OR jogo/referência):")
+        for ini in ("202101", "202301"):
+            b2, V2 = feminizacao(df.filter(pl.col("cmp") >= ini))
+            linha_or(f"  a partir de {ini[:4]}", b2, V2, [-1])
         an = d.with_columns(ano=pl.col("cmp").str.slice(0, 4)).group_by("ano").agg(
             pl.col("jogo_F", "jogo_M", "referencia_F", "referencia_M").sum()).sort("ano")
         out("  % mulheres por ano (jogo | referência): " + "  ".join(
@@ -682,7 +742,6 @@ def figuras(A, S, sens):
     matplotlib.use("Agg")
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
-    from statsmodels.stats.proportion import proportion_confint
 
     plt.rcParams.update({
         "font.family": "DejaVu Sans", "font.size": 8, "axes.edgecolor": TINTA2, "axes.labelcolor": TINTA,
@@ -724,7 +783,7 @@ def figuras(A, S, sens):
         for col, cor, rot in (("jogo", AZUL, "Jogo patológico (F63.0)"), ("referencia", TINTA2, "Referência (sistema)"),
                               ("controle", LARANJA, "Controle (F63.1–F63.3)")):
             s = df[col].cast(pl.Float64)
-            ax.plot(x, (s / s.head(12).mean()).rolling_mean(3, center=True, min_samples=1), color=cor, lw=1.8, label=rot)
+            ax.plot(x, (s / s.filter(df["cmp"].str.starts_with("2018")).mean()).rolling_mean(3, center=True, min_samples=1), color=cor, lw=1.8, label=rot)
     axs[0].set_ylabel("Registros mensais / média de 2018\n(escala log; média móvel de 3 meses)")
     h, l_ = axs[0].get_legend_handles_labels()
     fig.legend(h, l_, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.02))
@@ -780,18 +839,14 @@ def figuras(A, S, sens):
     fig.tight_layout()
     salvar(fig, "fig3_robustez")
 
-    # Figura 4: % de mulheres por ano (IC de Wilson)
+    # Figura 4: % de mulheres por ano (sem IC: registros do mesmo paciente não são independentes)
     fig, axs = plt.subplots(1, 2, figsize=(7.2, 2.9), sharey=True)
     for ax, (f, tit) in zip(axs, paineis):
         an = (S[f].with_columns(ano=pl.col("cmp").str.slice(0, 4).cast(pl.Int32)).group_by("ano")
               .agg(pl.col("jogo_F", "jogo_M", "referencia_F", "referencia_M").sum()).sort("ano"))
-        for gr, cor, rot, mk, dx in (("jogo", AZUL, "Jogo patológico (F63.0)", "o", 0.08),
-                                     ("referencia", TINTA2, "Referência", "s", -0.08)):
+        for gr, cor, rot, mk in (("jogo", AZUL, "Jogo patológico (F63.0)", "o"), ("referencia", TINTA2, "Referência", "s")):
             fe, ma = an[f"{gr}_F"].to_numpy(), an[f"{gr}_M"].to_numpy()
-            li, ls = proportion_confint(fe, fe + ma, method="wilson")
-            p = fe / (fe + ma)
-            ax.errorbar(an["ano"].to_numpy() + dx, 100 * p, yerr=[100 * (p - li), 100 * (ls - p)], color=cor,
-                        marker=mk, ms=4, lw=1.5, capsize=0, label=rot)
+            ax.plot(an["ano"].to_numpy(), 100 * fe / (fe + ma), color=cor, marker=mk, ms=4, lw=1.5, label=rot)
         ax.set_title(tit, loc="left", fontsize=9, color=TINTA, fontweight="bold")
         ax.set_ylim(0, 100)
         ax.set_xticks(an["ano"].to_list(), [str(k) for k in an["ano"].to_list()], fontsize=7)
