@@ -12,3 +12,7 @@ wheels/
 # dados baixados/gerados
 data/
 .ipynb_checkpoints/
+
+# arquivos compactados trazidos de fora (dados brutos ficam só em data/)
+*.zip
+*.part
